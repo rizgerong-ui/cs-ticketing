@@ -281,7 +281,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=='/': return self.respond((ROOT/'index.html').read_bytes(),content_type='text/html')
             if parsed.path=='/validation-ui.js': return self.respond((ROOT/'validation-ui.js').read_bytes(),content_type='text/javascript')
             if parsed.path=='/validation.css': return self.respond((ROOT/'validation.css').read_bytes(),content_type='text/css')
-            if parsed.path=='/api/config': return self.respond({**get_config(),'token':TOKEN,'currentUser':user,'importedAt':SOURCE['importedAt'],'importedCount':len(all_tickets()),'syncConfigured':bool(os.environ.get('CS_SHEETS_URL') and os.environ.get('CS_SHEETS_SECRET'))})
+            if parsed.path=='/api/config': return self.respond({**get_config(),'token':TOKEN,'currentUser':user,'ticketFields':FIELDS,'ticketHeaders':HEADERS,'importedAt':SOURCE['importedAt'],'importedCount':len(all_tickets()),'syncConfigured':bool(os.environ.get('CS_SHEETS_URL') and os.environ.get('CS_SHEETS_SECRET'))})
             if parsed.path=='/api/validation':
                 with connect() as con: data=validation.records(con)
                 return self.respond({'records':data,'schemas':validation.SCHEMAS,'diagnostics':validation.diagnostics(data),'importedAt':validation.SOURCE['importedAt']})
@@ -304,12 +304,12 @@ class Handler(BaseHTTPRequestHandler):
                         values=[t.get(k,'') for k in FIELDS]
                         writer.writerow([("'"+v) if isinstance(v,str) and v.lstrip().startswith(('=','+','-','@')) else v for v in values])
                     return self.respond(('\ufeff'+out.getvalue()).encode(),content_type='text/csv')
-                active=[t for t in tickets if t['ticketStatus']!='Closed']
+                active=[t for t in tickets if str(t.get('status','')).strip().casefold()!='resolved']
                 stats={'total':len(tickets),'open':len(active),'aged':sum((t['aging'] or 0)>7 for t in active),'critical':sum(t['severity']=='Critical' for t in active),'queued':sum(not t['synced'] for t in tickets)}
                 search=q.get('q',[''])[0].lower(); status=q.get('status',[''])[0]; owner=q.get('owner',[''])[0]; view=q.get('view',['all'])[0]
                 client=q.get('client',[''])[0]; subclient=q.get('subclient',[''])[0]; ticket_query=q.get('ticket',[''])[0].strip().casefold()
                 filter_options={'clients':sorted({t['client'] for t in tickets if t.get('client')}),'subclients':sorted({t['subClient'] for t in tickets if t.get('subClient')})}
-                filtered=[t for t in tickets if (not search or search in ' '.join(str(t.get(k,'')) for k in ['id','client','details','plate','category']).lower()) and (not status or t['status']==status) and (not owner or t['assigned']==owner) and (view!='open' or t['ticketStatus']!='Closed') and (view!='aged' or t['ticketStatus']!='Closed' and (t['aging'] or 0)>7)]
+                filtered=[t for t in tickets if (not search or search in ' '.join(str(t.get(k,'')) for k in ['id','client','details','plate','category']).lower()) and (not status or t['status']==status) and (not owner or t['assigned']==owner) and (view!='open' or str(t.get('status','')).strip().casefold()!='resolved') and (view!='aged' or str(t.get('status','')).strip().casefold()!='resolved' and (t['aging'] or 0)>7) and (view!='critical' or str(t.get('status','')).strip().casefold()!='resolved' and t.get('severity')=='Critical')]
                 filtered=[t for t in filtered if (not client or t.get('client')==client) and (not subclient or t.get('subClient')==subclient) and (not ticket_query or any(ticket_query in str(t.get(k,'')).casefold() for k in ('id','parentTicket2')))]
                 client_matches=[list(pair) for pair in sorted({(t.get('client',''),t.get('subClient','')) for t in filtered})]
                 page=max(1,int(q.get('page',['1'])[0])); start=(page-1)*40
