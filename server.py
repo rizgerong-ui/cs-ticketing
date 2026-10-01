@@ -27,6 +27,7 @@ CONFIG = SOURCE['config']
 HEADERS = SOURCE['headers']
 FIELDS = ['id','month','client','subClient','clientCategory','opened','responded','openTime','category','concern','source','direction','details','latestNotes','cs','status','assigned','department','closed','aging','ticketStatus','severity','agingCategory','general','detailedConcern','clientCode','status2','parentTicket','plate','parentTicket2','createdBy','ticketAging','aging2','closeTime','closeChecker','closedBy','masterlistCheck','timeCheck','keyAccount']
 CLOSED = {'Resolved', 'Temporarily Closed'}
+EDITABLE = {'client','opened','responded','openTime','category','source','direction','details','latestNotes','cs','status','assigned','closed','parentTicket','plate','parentTicket2','createdBy','closeTime','closedBy'}
 
 class Connection(sqlite3.Connection):
     def __exit__(self, kind, value, traceback):
@@ -65,6 +66,7 @@ def initialize():
         CREATE TABLE IF NOT EXISTS tickets(id TEXT PRIMARY KEY, data TEXT NOT NULL, updated TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, synced INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS events(event_id INTEGER PRIMARY KEY, ticket_id TEXT NOT NULL, actor TEXT NOT NULL, at TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS deleted_tickets(ticket_id TEXT PRIMARY KEY, actor TEXT NOT NULL, at TEXT NOT NULL);
         ''')
         if not con.execute("SELECT 1 FROM settings WHERE key='imported'").fetchone():
             for row in SOURCE['rows']:
@@ -107,16 +109,18 @@ def decorate(row, cfg=None):
     t.update(version=row['version'], synced=row['synced'] == row['version'], updated=row['updated'])
     return t
 
-def all_tickets():
+def all_tickets(deleted=False):
     with connect() as con:
         cfg=validation.config(con)
-        return [decorate(r,cfg) for r in con.execute('SELECT * FROM tickets ORDER BY rowid DESC')]
+        deleted_ids={r['ticket_id'] for r in con.execute('SELECT ticket_id FROM deleted_tickets')}
+        return [decorate(r,cfg) for r in con.execute('SELECT * FROM tickets ORDER BY rowid DESC') if (r['id'] in deleted_ids)==deleted]
 
 def detail(ticket_id):
     with connect() as con:
         row = con.execute('SELECT * FROM tickets WHERE id=?',(ticket_id,)).fetchone()
         if not row: raise ValueError('Ticket not found')
         t = decorate(row)
+        t['deleted']=bool(con.execute('SELECT 1 FROM deleted_tickets WHERE ticket_id=?',(ticket_id,)).fetchone())
         t['events'] = [dict(r) for r in con.execute('SELECT actor,at,kind,body FROM events WHERE ticket_id=? ORDER BY event_id DESC',(ticket_id,))]
         return t
 
@@ -133,6 +137,7 @@ def save(payload):
         if payload.get('id'):
             row = con.execute('SELECT * FROM tickets WHERE id=?',(payload['id'],)).fetchone()
             require(row, 'Ticket not found')
+            require(not con.execute('SELECT 1 FROM deleted_tickets WHERE ticket_id=?',(payload['id'],)).fetchone(), 'Restore this ticket before editing.')
             require(row['version'] == payload.get('version'), 'This ticket changed. Reopen it before saving.')
             t = json.loads(row['data'])
             status = payload.get('status',t['status'])
@@ -186,6 +191,63 @@ def save(payload):
             con.execute('INSERT INTO events(ticket_id,actor,at,kind,body) VALUES(?,?,?,?,?)',(t['id'],actor,stamp,'created','Ticket created in CS Desk'))
     return detail(t['id'])
 
+def modify_ticket(payload):
+    actor=str(payload.get('actor','')).strip(); stamp=now()
+    with connect() as con:
+        con.execute('BEGIN IMMEDIATE')
+        cfg=validation.config(con)
+        require(actor in [s['name'] for s in cfg['staff']] or (bool(PUBLIC_ORIGIN) and staff_auth.approved(actor)), 'Choose a CS operator.')
+        row=con.execute('SELECT * FROM tickets WHERE id=?',(payload.get('id'),)).fetchone()
+        require(row, 'Ticket not found')
+        require(row['version']==payload.get('version'), 'This ticket changed. Reopen it before saving.')
+        t=json.loads(row['data']); before=dict(t)
+        deleted=bool(con.execute('SELECT 1 FROM deleted_tickets WHERE ticket_id=?',(t['id'],)).fetchone())
+        action=payload.get('action')
+        if action in ('delete','restore'):
+            require(deleted==(action=='restore'), 'Ticket is already in that state.')
+            if action=='delete': con.execute('INSERT INTO deleted_tickets(ticket_id,actor,at) VALUES(?,?,?)',(t['id'],actor,stamp))
+            else: con.execute('DELETE FROM deleted_tickets WHERE ticket_id=?',(t['id'],))
+            body='Moved to Deleted tickets; original Google Sheet unchanged.' if action=='delete' else 'Restored from Deleted tickets.'
+        else:
+            require(action=='edit' and not deleted, 'Restore this ticket before editing.')
+            changes=payload.get('changes')
+            require(isinstance(changes,dict) and bool(changes), 'No changes supplied.')
+            require(set(changes)<=EDITABLE, 'Validation-derived fields and ticket ID cannot be edited here.')
+            for key,value in changes.items():
+                require(isinstance(value,str) and len(value)<=10000, 'Invalid field value.')
+                t[key]=value.strip()
+            for key,kind in [('client','clients'),('category','categories'),('assigned','staff'),('cs','staff')]:
+                if t.get(key)!=before.get(key): require(validation.find(cfg[kind],t[key]), 'Choose a valid '+key+'.')
+            for key,kind in [('status','statuses'),('source','sources'),('direction','directions')]:
+                if t.get(key)!=before.get(key): require(t[key] in cfg[kind], 'Choose a valid '+key+'.')
+            for key in ('opened','responded','closed'):
+                if t.get(key):
+                    parsed=parse_date(t[key]); require(parsed, 'Enter a valid date for '+key+'.'); t[key]=parsed.isoformat()
+            require(t.get('opened') and t.get('details'), 'Date open and Details are required.')
+            for key in ('openTime','closeTime'):
+                value=t.get(key,'')
+                if value and value!=before.get(key):
+                    parsed=None
+                    for fmt in ('%H:%M','%H:%M:%S','%I:%M %p','%I:%M:%S %p'):
+                        try: parsed=datetime.strptime(value,fmt); break
+                        except ValueError: pass
+                    require(parsed, 'Enter a valid time for '+key+'.')
+                    t[key]=parsed.strftime('%I:%M %p')
+            if t.get('status')!=before.get('status'):
+                if cfg['statusRules'][t['status']]=='closed':
+                    t['closed']=t.get('closed') or date.today().isoformat()
+                    t['closeTime']=t.get('closeTime') or datetime.now().strftime('%I:%M %p')
+                    t['closedBy']=actor
+                elif cfg['statusRules'].get(before.get('status'))=='closed': t.update(closed='',closeTime='',closedBy='')
+            require(not t.get('closed') or parse_date(t['closed'])>=parse_date(t['opened']), 'Date closed cannot be before date open.')
+            validation.derive(t,cfg)
+            diff={k:{'before':before.get(k,''),'after':v} for k,v in t.items() if v!=before.get(k)}
+            require(diff, 'No changes to save.')
+            body=json.dumps(diff,ensure_ascii=False)
+        con.execute('UPDATE tickets SET data=?,updated=?,version=version+1 WHERE id=?',(json.dumps(t),stamp,t['id']))
+        con.execute('INSERT INTO events(ticket_id,actor,at,kind,body) VALUES(?,?,?,?,?)',(t['id'],actor,stamp,action,body))
+    return detail(t['id'])
+
 def save_validation(payload):
     actor=str(payload.get('actor','')).strip(); stamp=now(); affected=0
     with connect() as con:
@@ -226,7 +288,7 @@ def sync_batch():
     require(SYNC_LOCK.acquire(blocking=False), 'A sync is already running.')
     try:
         with connect() as con:
-            rows=con.execute('SELECT * FROM tickets WHERE version != synced ORDER BY rowid LIMIT 200').fetchall()
+            rows=con.execute('SELECT * FROM tickets WHERE version != synced AND id NOT IN (SELECT ticket_id FROM deleted_tickets) ORDER BY rowid LIMIT 200').fetchall()
         if not rows: return {'sent':0,'remaining':0}
         cfg=get_config(); items=[]
         for r in rows:
@@ -238,7 +300,7 @@ def sync_batch():
         require(result.get('ok') and set(result.get('ids',[])) == {r['id'] for r in rows}, 'Google Sheets did not acknowledge this batch; it remains queued.')
         with connect() as con:
             for r in rows: con.execute('UPDATE tickets SET synced=? WHERE id=? AND version=?',(r['version'],r['id'],r['version']))
-            remaining=con.execute('SELECT count(*) FROM tickets WHERE version != synced').fetchone()[0]
+            remaining=con.execute('SELECT count(*) FROM tickets WHERE version != synced AND id NOT IN (SELECT ticket_id FROM deleted_tickets)').fetchone()[0]
         return {'sent':len(rows),'remaining':remaining}
     finally: SYNC_LOCK.release()
 
@@ -281,7 +343,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=='/': return self.respond((ROOT/'index.html').read_bytes(),content_type='text/html')
             if parsed.path=='/validation-ui.js': return self.respond((ROOT/'validation-ui.js').read_bytes(),content_type='text/javascript')
             if parsed.path=='/validation.css': return self.respond((ROOT/'validation.css').read_bytes(),content_type='text/css')
-            if parsed.path=='/api/config': return self.respond({**get_config(),'token':TOKEN,'currentUser':user,'ticketFields':FIELDS,'ticketHeaders':HEADERS,'importedAt':SOURCE['importedAt'],'importedCount':len(all_tickets()),'syncConfigured':bool(os.environ.get('CS_SHEETS_URL') and os.environ.get('CS_SHEETS_SECRET'))})
+            if parsed.path=='/api/config': return self.respond({**get_config(),'token':TOKEN,'currentUser':user,'editableFields':sorted(EDITABLE),'ticketFields':FIELDS,'ticketHeaders':HEADERS,'importedAt':SOURCE['importedAt'],'importedCount':len(all_tickets()),'syncConfigured':bool(os.environ.get('CS_SHEETS_URL') and os.environ.get('CS_SHEETS_SECRET'))})
             if parsed.path=='/api/validation':
                 with connect() as con: data=validation.records(con)
                 return self.respond({'records':data,'schemas':validation.SCHEMAS,'diagnostics':validation.diagnostics(data),'importedAt':validation.SOURCE['importedAt']})
@@ -307,6 +369,7 @@ class Handler(BaseHTTPRequestHandler):
                 active=[t for t in tickets if str(t.get('status','')).strip().casefold()!='resolved']
                 stats={'total':len(tickets),'open':len(active),'aged':sum((t['aging'] or 0)>7 for t in active),'critical':sum(t['severity']=='Critical' for t in active),'queued':sum(not t['synced'] for t in tickets)}
                 search=q.get('q',[''])[0].lower(); status=q.get('status',[''])[0]; owner=q.get('owner',[''])[0]; view=q.get('view',['all'])[0]
+                if view=='deleted': tickets=all_tickets(deleted=True)
                 client=q.get('client',[''])[0]; subclient=q.get('subclient',[''])[0]; ticket_query=q.get('ticket',[''])[0].strip().casefold()
                 filter_options={'clients':sorted({t['client'] for t in tickets if t.get('client')}),'subclients':sorted({t['subClient'] for t in tickets if t.get('subClient')})}
                 filtered=[t for t in tickets if (not search or search in ' '.join(str(t.get(k,'')) for k in ['id','client','details','plate','category']).lower()) and (not status or t['status']==status) and (not owner or t['assigned']==owner) and (view!='open' or str(t.get('status','')).strip().casefold()!='resolved') and (view!='aged' or str(t.get('status','')).strip().casefold()!='resolved' and (t['aging'] or 0)>7) and (view!='critical' or str(t.get('status','')).strip().casefold()!='resolved' and t.get('severity')=='Critical')]
@@ -339,6 +402,7 @@ class Handler(BaseHTTPRequestHandler):
             payload=json.loads(self.rfile.read(size))
             if user: payload['actor']=user
             if self.path=='/api/ticket': return self.respond(save(payload))
+            if self.path=='/api/ticket/modify': return self.respond(modify_ticket(payload))
             if self.path=='/api/validation': return self.respond(save_validation(payload))
             if self.path=='/api/sheet-conflict': return self.respond(sheets_import.resolve(sys.modules[__name__],payload))
             if self.path=='/api/sync': return self.respond(sync_batch())
