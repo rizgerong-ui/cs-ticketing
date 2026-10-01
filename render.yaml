@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: cs-ticketing
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_PUBLISHABLE_KEY
+        sync: false
+      - key: CS_STAFF_DOMAIN
+        value: findme.com.ph
+      - key: TZ
+        value: Asia/Taipei

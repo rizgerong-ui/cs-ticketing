@@ -1,0 +1,11 @@
+*.sqlite3*
+*.db
+.env*
+__pycache__/
+*.log
+source.json
+validation-source.json
+*.png
+.venv/
+connection-status.json
+migration-status.json
