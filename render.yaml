@@ -6,10 +6,18 @@ services:
     region: singapore
     healthCheckPath: /healthz
     envVars:
-      - key: DATABASE_URL
+      - key: PGHOST
+        value: aws-0-ap-northeast-1.pooler.supabase.com
+      - key: PGPORT
+        value: "5432"
+      - key: PGDATABASE
+        value: postgres
+      - key: PGUSER
+        value: postgres.phcvhjincnuvkeouqcaq
+      - key: PGPASSWORD
         sync: false
       - key: SUPABASE_URL
-        sync: false
+        value: https://phcvhjincnuvkeouqcaq.supabase.co
       - key: SUPABASE_PUBLISHABLE_KEY
         sync: false
       - key: CS_STAFF_DOMAIN

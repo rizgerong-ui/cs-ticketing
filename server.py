@@ -13,6 +13,11 @@ ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get('CS_DB_PATH', str(ROOT / 'tickets.sqlite3')))
 PORT = int(os.environ.get('PORT', os.environ.get('CS_PORT', '8765')))
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
+if not DATABASE_URL and os.environ.get('PGHOST'):
+    from psycopg.conninfo import make_conninfo
+    DATABASE_URL = make_conninfo(host=os.environ['PGHOST'], port=os.environ.get('PGPORT','5432'),
+        dbname=os.environ.get('PGDATABASE','postgres'), user=os.environ.get('PGUSER','postgres'),
+        password=os.environ.get('PGPASSWORD',''), sslmode='require')
 PUBLIC_ORIGIN = os.environ.get('CS_PUBLIC_ORIGIN', os.environ.get('RENDER_EXTERNAL_URL', '')).rstrip('/')
 HOST = '0.0.0.0' if PUBLIC_ORIGIN else '127.0.0.1'
 TOKEN = secrets.token_urlsafe(32)

@@ -9,8 +9,8 @@ Use the existing Supabase database and Render's Free Docker web service. No purc
 1. In Supabase **Authentication → Users**, create accounts for approved staff using their `@findme.com.ph` addresses. Keep public sign-ups disabled. Confirm the accounts under your organization's account-verification process. Each staff member needs their own password; do not use the database password as a login password.
 2. In Render choose **New → Blueprint** and connect this repository. Review the service plan: **Free**.
 3. Enter the prompted environment variables privately in Render:
-   - `DATABASE_URL`: Supabase Session pooler URI with the database password URL-encoded, and `?sslmode=require` appended.
-   - `SUPABASE_URL`: project URL from Supabase project settings.
+   - `PGPASSWORD`: the Supabase database password, entered exactly as-is. The pooler host, database and username are prefilled and the backend requires TLS.
+   - `SUPABASE_URL`: project URL, already prefilled.
    - `SUPABASE_PUBLISHABLE_KEY`: Supabase publishable key (or legacy anon key), never a service-role key.
    - `CS_STAFF_DOMAIN`: already set to `findme.com.ph` by the blueprint.
 4. Deploy. The server uses Render's assigned HTTPS origin automatically. Use `/healthz` for health checks.
