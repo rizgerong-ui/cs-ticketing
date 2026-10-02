@@ -49,19 +49,20 @@ def baselines(server,con):
         con.execute('INSERT INTO sheet_baselines VALUES(?,?,?,?) ON CONFLICT(key) DO NOTHING',(key,'lookup',r['recordId'],json.dumps(data)))
     con.execute("INSERT INTO sheet_sync_state VALUES('baseline_ready','true')")
 
-def merge(con,key,entity_type,entity_id,current,base,incoming,fields,stamp):
+def merge(con,key,entity_type,entity_id,current,base,incoming,fields,stamp,conflict_keys=None):
     result=dict(current)
     for field in fields:
         remote=incoming.get(field,'');local=current.get(field,'');old=base.get(field,'')
         conflict_key=key+':'+field
         if remote==local:
-            con.execute('DELETE FROM sheet_conflicts WHERE key=?',(conflict_key,));continue
+            if conflict_keys is None or conflict_key in conflict_keys:con.execute('DELETE FROM sheet_conflicts WHERE key=?',(conflict_key,))
+            continue
         if remote==old:
-            con.execute('UPDATE sheet_conflicts SET local_value=?,sheet_value=?,at=? WHERE key=?',(json.dumps(local),json.dumps(remote),stamp,conflict_key))
+            if conflict_keys is None or conflict_key in conflict_keys:con.execute('UPDATE sheet_conflicts SET local_value=?,sheet_value=?,at=? WHERE key=?',(json.dumps(local),json.dumps(remote),stamp,conflict_key))
             continue
         if local==old:
             result[field]=remote
-            con.execute('DELETE FROM sheet_conflicts WHERE key=?',(conflict_key,))
+            if conflict_keys is None or conflict_key in conflict_keys:con.execute('DELETE FROM sheet_conflicts WHERE key=?',(conflict_key,))
         else:
             con.execute('INSERT INTO sheet_conflicts VALUES(?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET entity_type=excluded.entity_type,entity_id=excluded.entity_id,field=excluded.field,local_value=excluded.local_value,sheet_value=excluded.sheet_value,at=excluded.at',(conflict_key,entity_type,entity_id,field,json.dumps(local),json.dumps(remote),stamp))
     return result
@@ -77,18 +78,22 @@ def apply_snapshot(server,snapshot):
     incoming_ids={t['id'] for t in incoming_by_row.values()}
     with server.connect() as con:
         setup(con);con.execute('BEGIN IMMEDIATE');baselines(server,con)
+        baseline_rows={r['key']:r for r in con.execute('SELECT * FROM sheet_baselines').fetchall()}
+        ticket_rows={r['id']:r for r in con.execute('SELECT * FROM tickets').fetchall()}
+        lookup_rows={r['id']:r for r in con.execute('SELECT * FROM validation_records').fetchall()}
+        conflict_keys={r['key'] for r in con.execute('SELECT key FROM sheet_conflicts').fetchall()}
         for key,kind,r in keyed_lookups(server,desired):
             incoming={k:v for k,v in r.items() if k not in ('recordId','version')}
-            baseline=con.execute('SELECT * FROM sheet_baselines WHERE key=?',(key,)).fetchone()
-            current_row=con.execute('SELECT * FROM validation_records WHERE id=?',(baseline['entity_id'],)).fetchone() if baseline else None
+            baseline=baseline_rows.get(key)
+            current_row=lookup_rows.get(baseline['entity_id']) if baseline else None
             if not current_row and not baseline:
                 # An app-created row with the same name is reconciled, not duplicated.
                 candidates=server.validation.records(con)[kind]
                 candidate=server.validation.find(candidates,incoming['name'])
-                if candidate:current_row=con.execute('SELECT * FROM validation_records WHERE id=?',(candidate['recordId'],)).fetchone()
+                if candidate:current_row=lookup_rows.get(candidate['recordId'])
             if current_row:
                 entity_id=current_row['id'];before=json.loads(current_row['data']);base=json.loads(baseline['data']) if baseline else {}
-                after=merge(con,key,'lookup',entity_id,before,base,incoming,[f for f,_ in server.validation.SCHEMAS[kind]['fields']],stamp)
+                after=merge(con,key,'lookup',entity_id,before,base,incoming,[f for f,_ in server.validation.SCHEMAS[kind]['fields']],stamp,conflict_keys)
                 if after!=before:
                     con.execute('UPDATE validation_records SET data=?,version=version+1 WHERE id=?',(json.dumps(after),entity_id))
                     con.execute('INSERT INTO validation_audit(record_id,actor,at,before_data,after_data) VALUES(?,?,?,?,?)',(entity_id,'Google Sheets sync',stamp,json.dumps(before),json.dumps(after)))
@@ -97,13 +102,14 @@ def apply_snapshot(server,snapshot):
                 entity_id='sheet-'+kind+'-'+hashlib.sha256(key.encode()).hexdigest()[:20]
                 position=con.execute('SELECT coalesce(max(position),0)+1 FROM validation_records WHERE kind=?',(kind,)).fetchone()[0]
                 con.execute('INSERT INTO validation_records(id,kind,data,position) VALUES(?,?,?,?)',(entity_id,kind,json.dumps(incoming),position));lookup_changes+=1
-            con.execute('INSERT INTO sheet_baselines VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET entity_type=excluded.entity_type,entity_id=excluded.entity_id,data=excluded.data',(key,'lookup',entity_id,json.dumps(incoming)))
+            if not baseline or json.loads(baseline['data'])!=incoming:
+                con.execute('INSERT INTO sheet_baselines VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET entity_type=excluded.entity_type,entity_id=excluded.entity_id,data=excluded.data',(key,'lookup',entity_id,json.dumps(incoming)))
         cfg=server.validation.config(con)
         for row_number,values in enumerate(snapshot['ticketRows'][1:],2):
             if len(values)<3 or not values[2] or not values[0]:continue
             incoming=ticket(server,values,row_number);entity_id=incoming['id'];key='ticket:'+entity_id
-            row=con.execute('SELECT * FROM tickets WHERE id=?',(entity_id,)).fetchone()
-            baseline=con.execute('SELECT * FROM sheet_baselines WHERE key=?',(key,)).fetchone()
+            row=ticket_rows.get(entity_id)
+            baseline=baseline_rows.get(key)
             if not row:
                 after=server.validation.derive(dict(incoming),cfg)
                 con.execute('INSERT INTO tickets(id,data,updated) VALUES(?,?,?)',(entity_id,json.dumps(after),stamp))
@@ -112,14 +118,17 @@ def apply_snapshot(server,snapshot):
                 added+=1
             else:
                 before=json.loads(row['data']);base=json.loads(baseline['data']) if baseline else {}
-                after=merge(con,key,'ticket',entity_id,before,base,incoming,DIRECT,stamp)
+                after=merge(con,key,'ticket',entity_id,before,base,incoming,DIRECT,stamp,conflict_keys)
                 after=server.validation.derive(after,cfg)
                 if after!=before:
                     con.execute('UPDATE tickets SET data=?,updated=?,version=version+1 WHERE id=?',(json.dumps(after),stamp,entity_id))
                     changes={k:{'before':before.get(k,''),'after':v} for k,v in after.items() if before.get(k)!=v}
                     con.execute('INSERT INTO events(ticket_id,actor,at,kind,body) VALUES(?,?,?,?,?)',(entity_id,'Google Sheets sync',stamp,'sheet update',json.dumps(changes,ensure_ascii=False)))
                     updated+=1
-            con.execute('INSERT INTO sheet_baselines VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET entity_type=excluded.entity_type,entity_id=excluded.entity_id,data=excluded.data',(key,'ticket',entity_id,json.dumps(incoming)))
+            if not baseline or json.loads(baseline['data'])!=incoming:
+                con.execute('INSERT INTO sheet_baselines VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET entity_type=excluded.entity_type,entity_id=excluded.entity_id,data=excluded.data',(key,'ticket',entity_id,json.dumps(incoming)))
+            ticket_rows[entity_id]={'id':entity_id,'data':json.dumps(after)}
+            baseline_rows[key]={'entity_id':entity_id,'data':json.dumps(incoming)}
         # App-created tickets also use the latest imported reference mappings.
         if lookup_changes:
             for row in con.execute('SELECT * FROM tickets').fetchall():
@@ -194,3 +203,4 @@ if __name__=='__main__':
     if len(sys.argv)!=2:raise SystemExit('Usage: python sheets_import.py SNAPSHOT.json')
     snapshot=json.loads(Path(sys.argv[1]).read_text(encoding='utf-8-sig'))
     print(json.dumps(apply_snapshot(server,snapshot)))
+
