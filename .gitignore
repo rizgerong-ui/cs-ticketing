@@ -9,3 +9,6 @@ validation-source.json
 .venv/
 connection-status.json
 migration-status.json
+
+*.dpapi
+*import-key*

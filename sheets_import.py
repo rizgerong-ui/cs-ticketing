@@ -73,6 +73,8 @@ def apply_snapshot(server,snapshot):
         if name not in snapshot:raise ValueError('Incomplete workbook snapshot: '+name)
     if not snapshot['cs'] or not snapshot['concerns']:raise ValueError('Validation reads were empty; no changes applied')
     desired=lookup_snapshot(server,snapshot);stamp=server.now();added=updated=lookup_changes=0
+    incoming_by_row={i:ticket(server,v,i) for i,v in enumerate(snapshot['ticketRows'][1:],2) if v and v[0]}
+    incoming_ids={t['id'] for t in incoming_by_row.values()}
     with server.connect() as con:
         setup(con);con.execute('BEGIN IMMEDIATE');baselines(server,con)
         for key,kind,r in keyed_lookups(server,desired):
@@ -126,8 +128,22 @@ def apply_snapshot(server,snapshot):
                     con.execute('UPDATE tickets SET data=?,updated=?,version=version+1 WHERE id=?',(json.dumps(after),stamp,row['id']))
                     changes={k:{'before':before.get(k,''),'after':v} for k,v in after.items() if before.get(k)!=v}
                     con.execute('INSERT INTO events(ticket_id,actor,at,kind,body) VALUES(?,?,?,?,?)',(row['id'],'Google Sheets sync',stamp,'lookup update',json.dumps(changes,ensure_ascii=False)));updated+=1
+        # A few source IDs are formulas that change as the workbook grows.
+        # Retain old records and history in the recoverable Deleted view, only
+        # when the same source row still has matching non-formula identity data.
+        archived=0
+        con.execute('CREATE TABLE IF NOT EXISTS deleted_tickets(ticket_id TEXT PRIMARY KEY, actor TEXT NOT NULL, at TEXT NOT NULL)')
+        for row in con.execute('SELECT * FROM tickets').fetchall():
+            old=json.loads(row['data']);replacement=incoming_by_row.get(old.get('sourceRow'))
+            if row['id'] in incoming_ids or not replacement:continue
+            if not all(old.get(k,'')==replacement.get(k,'') for k in ('client','opened','category','plate','details')):continue
+            if con.execute("SELECT 1 FROM events WHERE ticket_id=? AND kind IN ('edit','note','change','conflict resolved','restore')",(row['id'],)).fetchone():continue
+            if con.execute('SELECT 1 FROM deleted_tickets WHERE ticket_id=?',(row['id'],)).fetchone():continue
+            con.execute('INSERT INTO deleted_tickets VALUES(?,?,?)',(row['id'],'Google Sheets ID reconciliation',stamp))
+            con.execute('INSERT INTO events(ticket_id,actor,at,kind,body) VALUES(?,?,?,?,?)',(row['id'],'Google Sheets sync',stamp,'source ID changed','Historical copy retained; current source row uses '+replacement['id']))
+            archived+=1
         conflicts=con.execute('SELECT count(*) FROM sheet_conflicts').fetchone()[0]
-        result={'checkedAt':stamp,'snapshotAt':snapshot.get('importedAt',stamp),'added':added,'updated':updated,'lookupChanges':lookup_changes,'conflicts':conflicts,'mode':'scheduled','intervalMinutes':15}
+        result={'checkedAt':stamp,'snapshotAt':snapshot.get('importedAt',stamp),'added':added,'updated':updated,'lookupChanges':lookup_changes,'conflicts':conflicts,'archivedReplacedIDs':archived,'sourceTickets':len(incoming_ids),'mode':'scheduled','intervalMinutes':15}
         con.execute("INSERT INTO sheet_sync_state VALUES('latest',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(result),))
     return result
 

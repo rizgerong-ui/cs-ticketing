@@ -8,6 +8,7 @@ from urllib.request import Request, urlopen
 import validation
 import sheets_import
 import staff_auth
+import user_access
 
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get('CS_DB_PATH', str(ROOT / 'tickets.sqlite3')))
@@ -86,6 +87,7 @@ def initialize():
             con.execute("INSERT INTO settings VALUES('import_notes','done')")
     with connect() as con:
         validation.seed(con)
+    user_access.setup(connect,now)
 
 def get_config():
     with connect() as con: return validation.config(con)
@@ -332,7 +334,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.allowed(): return self.respond({'error':'Invalid host'},403)
         parsed=urlparse(self.path); q=parse_qs(parsed.query)
-        user = staff_auth.current(self.headers.get('Cookie')) if PUBLIC_ORIGIN and parsed.path!='/healthz' else None
+        user = user_access.current(sys.modules[__name__],self.headers.get('Cookie')) if PUBLIC_ORIGIN and parsed.path!='/healthz' else None
         if PUBLIC_ORIGIN and parsed.path!='/healthz' and not user:
             if parsed.path in ('/','/login'): return self.respond((ROOT/'login.html').read_bytes(),content_type='text/html')
             return self.respond({'error':'Please sign in with an approved staff account.'},401)
@@ -343,7 +345,9 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=='/': return self.respond((ROOT/'index.html').read_bytes(),content_type='text/html')
             if parsed.path=='/validation-ui.js': return self.respond((ROOT/'validation-ui.js').read_bytes(),content_type='text/javascript')
             if parsed.path=='/validation.css': return self.respond((ROOT/'validation.css').read_bytes(),content_type='text/css')
-            if parsed.path=='/api/config': return self.respond({**get_config(),'token':TOKEN,'currentUser':user,'editableFields':sorted(EDITABLE),'ticketFields':FIELDS,'ticketHeaders':HEADERS,'importedAt':SOURCE['importedAt'],'importedCount':len(all_tickets()),'syncConfigured':bool(os.environ.get('CS_SHEETS_URL') and os.environ.get('CS_SHEETS_SECRET'))})
+            if parsed.path=='/users-ui.js': return self.respond((ROOT/'users-ui.js').read_bytes(),content_type='text/javascript')
+            if parsed.path=='/api/users': return self.respond(user_access.listing(sys.modules[__name__],user))
+            if parsed.path=='/api/config': return self.respond({**get_config(),'token':TOKEN,'currentUser':user,'isAdmin':user_access.is_admin(sys.modules[__name__],user),'editableFields':sorted(EDITABLE),'ticketFields':FIELDS,'ticketHeaders':HEADERS,'importedAt':SOURCE['importedAt'],'importedCount':len(all_tickets()),'syncConfigured':bool(os.environ.get('CS_SHEETS_URL') and os.environ.get('CS_SHEETS_SECRET'))})
             if parsed.path=='/api/validation':
                 with connect() as con: data=validation.records(con)
                 return self.respond({'records':data,'schemas':validation.SCHEMAS,'diagnostics':validation.diagnostics(data),'importedAt':validation.SOURCE['importedAt']})
@@ -378,9 +382,13 @@ class Handler(BaseHTTPRequestHandler):
                 page=max(1,int(q.get('page',['1'])[0])); start=(page-1)*40
                 return self.respond({'tickets':filtered[start:start+40],'count':len(filtered),'stats':stats,'page':page,'filterOptions':filter_options,'clientMatches':client_matches})
             return self.respond({'error':'Not found'},404)
+        except PermissionError as e: return self.respond({'error':str(e)},403)
         except ValueError as e: return self.respond({'error':str(e)},400)
     def do_POST(self):
         if not self.allowed(): return self.respond({'error':'Invalid host'},403)
+        if self.path=='/api/sheet-import' and self.headers.get('Authorization'):
+            if not user_access.valid_sync_key(sys.modules[__name__],self.headers.get('Authorization')): return self.respond({'error':'Invalid import key'},403)
+            return self.import_snapshot()
         if PUBLIC_ORIGIN and self.headers.get('Origin') != PUBLIC_ORIGIN:
             return self.respond({'error':'Invalid origin'},403)
         if PUBLIC_ORIGIN and self.path=='/auth/login':
@@ -388,28 +396,46 @@ class Handler(BaseHTTPRequestHandler):
                 size=int(self.headers.get('Content-Length','0'))
                 require(0<size<=8192,'Invalid request size')
                 body=json.loads(self.rfile.read(size))
-                cookie=staff_auth.login(str(body.get('email','')).strip().lower(),str(body.get('password','')))
+                cookie=user_access.login(sys.modules[__name__],str(body.get('email','')).strip().lower(),str(body.get('password','')))
                 return self.respond({'ok':True},cookie=cookie)
             except (ValueError,TypeError,AttributeError):
                 return self.respond({'error':'Sign-in failed. Check your account or wait one minute before retrying.'},401)
         if PUBLIC_ORIGIN and self.path=='/auth/logout':
+            user_access.logout(sys.modules[__name__],self.headers.get('Cookie'))
             return self.respond({'ok':True},cookie=staff_auth.logout_cookie())
-        user=staff_auth.current(self.headers.get('Cookie')) if PUBLIC_ORIGIN else None
+        user=user_access.current(sys.modules[__name__],self.headers.get('Cookie')) if PUBLIC_ORIGIN else None
         if PUBLIC_ORIGIN and not user: return self.respond({'error':'Please sign in again.'},401)
         if self.headers.get('X-CS-Token')!=TOKEN: return self.respond({'error':'Reload this app before saving.'},403)
         try:
+            if self.path=='/api/sheet-import':
+                user_access.require_admin(sys.modules[__name__],user)
+                return self.import_snapshot()
             size=int(self.headers.get('Content-Length','0')); require(0<size<=50000,'Invalid request size')
             payload=json.loads(self.rfile.read(size))
             if user: payload['actor']=user
+            if self.path=='/api/users': return self.respond(user_access.save(sys.modules[__name__],payload,user))
+            if self.path=='/api/sheet-import/key': return self.respond(user_access.issue_sync_key(sys.modules[__name__],user))
             if self.path=='/api/ticket': return self.respond(save(payload))
             if self.path=='/api/ticket/modify': return self.respond(modify_ticket(payload))
             if self.path=='/api/validation': return self.respond(save_validation(payload))
             if self.path=='/api/sheet-conflict': return self.respond(sheets_import.resolve(sys.modules[__name__],payload))
             if self.path=='/api/sync': return self.respond(sync_batch())
             return self.respond({'error':'Not found'},404)
+        except PermissionError as e: return self.respond({'error':str(e)},403)
         except (ValueError, KeyError, TypeError) as e: return self.respond({'error':str(e)},400)
         except Exception: return self.respond({'error':'The operation could not finish. Your saved tickets remain in the database; retry or check the connection.'},500)
     def log_message(self,*args): pass
+    def import_snapshot(self):
+        try:
+            size=int(self.headers.get('Content-Length','0'));require(0<size<=25000000,'Invalid snapshot size')
+            snapshot=json.loads(self.rfile.read(size))
+            require(isinstance(snapshot,dict),'Invalid snapshot')
+            with SYNC_LOCK:
+                result=sheets_import.apply_snapshot(sys.modules[__name__],snapshot)
+            result['total']=len(all_tickets());result['database']='postgresql' if DATABASE_URL else 'sqlite'
+            return self.respond(result)
+        except (ValueError,TypeError,KeyError) as e:return self.respond({'error':str(e)},400)
+        except Exception:return self.respond({'error':'Import failed; retry or check the database connection.'},500)
 
 if __name__=='__main__':
     initialize()
